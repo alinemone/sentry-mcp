@@ -71,7 +71,7 @@ def build_app(api_key: str) -> Starlette:
     app = Starlette(
         debug=False,
         routes=[
-            Route("/healthz", endpoint=healthz),
+            Route("/health", endpoint=healthz),
             Mount("/mcp", app=handle_mcp),
         ],
         lifespan=lifespan,
