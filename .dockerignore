@@ -1,0 +1,16 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.git/
+.gitignore
+.idea/
+.vscode/
+.env
+.env.example
+*.bak
+*.bak-*
+Dockerfile
+docker-compose.yml
