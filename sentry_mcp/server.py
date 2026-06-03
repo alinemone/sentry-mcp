@@ -1,5 +1,7 @@
 """MCP Server for Sentry Performance and Issues Analysis."""
 
+import contextvars
+import threading
 from typing import Any
 from mcp.server import Server
 from mcp.types import Tool, TextContent
@@ -8,14 +10,31 @@ from .client import SentryClient
 
 
 server = Server("sentry-mcp")
-sentry_client: SentryClient | None = None
+
+# Per-request Sentry token, populated by the HTTP layer's PerUserTokenMiddleware
+# from the incoming header. call_tool runs in the same async task that served
+# the request, so it sees the value set here.
+_token_var: contextvars.ContextVar[str] = contextvars.ContextVar("sentry_token", default="")
+
+# One SentryClient per distinct token (org/base_url come from shared env).
+_clients_lock = threading.Lock()
+_clients: dict[str, SentryClient] = {}
 
 
 def get_client() -> SentryClient:
-    global sentry_client
-    if sentry_client is None:
-        sentry_client = SentryClient()
-    return sentry_client
+    """Return a SentryClient bound to the current request's token (from the
+    X-Sentry-Token header)."""
+    token = _token_var.get()
+    if not token:
+        raise ValueError(
+            "missing Sentry token — send your token in the 'X-Sentry-Token' header"
+        )
+    with _clients_lock:
+        client = _clients.get(token)
+        if client is None:
+            client = SentryClient(token=token)  # org / base_url / default slug from env
+            _clients[token] = client
+        return client
 
 
 _PROJECT_PROPERTY = {

@@ -13,44 +13,59 @@ from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Mount, Route
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .server import server
+from .server import server, _token_var
 
 logger = logging.getLogger(__name__)
 
+TOKEN_HEADER = os.getenv("SENTRY_TOKEN_HEADER", "X-Sentry-Token").lower()
 
-class ApiKeyMiddleware:
-    """Reject requests to /mcp without the right ?api_key=… query param."""
 
-    def __init__(self, app: ASGIApp, api_key: str, protected_path: str = "/mcp") -> None:
+class PerUserTokenMiddleware:
+    """Pull each user's Sentry token from the request header into a contextvar
+    for the duration of the request, so every tool call authenticates as the
+    caller instead of a single shared server token.
+
+    Replaces the old shared ?api_key gate: the user's own token IS the auth now
+    (an invalid token is rejected by Sentry).
+    """
+
+    def __init__(self, app: ASGIApp, header_name: str = TOKEN_HEADER, protected_path: str = "/mcp") -> None:
         self.app = app
-        self.api_key = api_key
+        self.header = header_name.lower().encode()
         self.protected_path = protected_path
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http":
+        if scope["type"] != "http" or not scope.get("path", "").startswith(self.protected_path):
             await self.app(scope, receive, send)
             return
 
-        path = scope.get("path", "")
-        if not path.startswith(self.protected_path):
-            await self.app(scope, receive, send)
-            return
+        headers = dict(scope.get("headers") or [])
+        token = headers.get(self.header, b"").decode().strip()
+        if not token:
+            auth = headers.get(b"authorization", b"").decode()
+            if auth.lower().startswith("bearer "):
+                token = auth[7:].strip()
 
-        request = Request(scope, receive=receive)
-        provided = request.query_params.get("api_key") or request.headers.get("x-api-key")
-        if provided != self.api_key:
-            response = PlainTextResponse("Unauthorized", status_code=401)
+        if not token:
+            response = PlainTextResponse(
+                f"missing Sentry token — send your token in the '{TOKEN_HEADER}' header",
+                status_code=401,
+            )
             await response(scope, receive, send)
             return
 
-        await self.app(scope, receive, send)
+        reset = _token_var.set(token)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _token_var.reset(reset)
 
 
 async def healthz(_request: Request) -> Response:
     return PlainTextResponse("ok")
 
 
-def build_app(api_key: str) -> Starlette:
+def build_app() -> Starlette:
     session_manager = StreamableHTTPSessionManager(
         app=server,
         event_store=None,
@@ -77,25 +92,22 @@ def build_app(api_key: str) -> Starlette:
         lifespan=lifespan,
     )
 
-    return ApiKeyMiddleware(app, api_key=api_key, protected_path="/mcp")
+    return PerUserTokenMiddleware(app, protected_path="/mcp")
 
 
 def main() -> None:
     load_dotenv()
-
-    api_key = os.getenv("MCP_API_KEY")
-    if not api_key:
-        raise SystemExit(
-            "MCP_API_KEY is required for HTTP mode. Set it in .env (long random string)."
-        )
 
     host = os.getenv("MCP_HOST", "0.0.0.0")
     port = int(os.getenv("MCP_PORT", "8765"))
 
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-    app = build_app(api_key=api_key)
-    logger.info(f"Starting Sentry MCP HTTP server on {host}:{port} (path /mcp)")
+    app = build_app()
+    logger.info(
+        f"Starting Sentry MCP HTTP server on {host}:{port} "
+        f"(path /mcp, per-user token via '{TOKEN_HEADER}' header)"
+    )
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
